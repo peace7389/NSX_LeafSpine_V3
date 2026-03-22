@@ -1,0 +1,7 @@
+# Build artifacts
+leafspine
+*.o
+*.dSYM/
+
+# macOS
+.DS_Store
