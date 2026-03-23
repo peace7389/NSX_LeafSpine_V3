@@ -58,7 +58,7 @@ double avg_latency_ns(const Stats& s) {
 }
 
 int main(int argc, char* argv[]) {
-    TopoConfig cfg{8, 16, 16};  // 8 spines × 16 leaves × 16 NICs = 2048 NICs
+    TopoConfig cfg{8, 16, 16};  // 8 spines × 16 leaves × 16 NICs/leaf = 256 NICs
     int threads = 1;
 #ifdef _OPENMP
     threads = omp_get_max_threads();
@@ -100,13 +100,19 @@ int main(int argc, char* argv[]) {
         auto sr = seq.run();
         auto pr = par.run(1);
 
+        MetSim met(cfg);
+        auto mr = met.run(1);
+
         printf("  Sequential : %lld pkts  avg latency %.1f ns\n",
                (long long)sr.stats.pkts_delivered, avg_latency_ns(sr.stats));
         printf("  Parallel   : %lld pkts  avg latency %.1f ns\n",
                (long long)pr.stats.pkts_delivered, avg_latency_ns(pr.stats));
+        printf("  MET        : %lld pkts  avg latency %.1f ns\n",
+               (long long)mr.stats.pkts_delivered, avg_latency_ns(mr.stats));
         printf("  Packets    : %s\n",
-               sr.stats.pkts_delivered == pr.stats.pkts_delivered
-               ? "MATCH" : "DIFFER (check RNG seeding)");
+               (sr.stats.pkts_delivered == pr.stats.pkts_delivered &&
+                sr.stats.pkts_delivered == mr.stats.pkts_delivered)
+               ? "ALL MATCH" : "DIFFER (check RNG seeding)");
 
         // Show serialization cost for a typical packet
         int32_t avg_pkt = 780;
@@ -228,9 +234,9 @@ int main(int argc, char* argv[]) {
     struct TT { TopoConfig tc; const char* label; };
     std::vector<TT> tests;
     tests.push_back({cfg, "User config"});
-    if (N < 4096)  tests.push_back({{8, 32, 16}, "4096 NICs"});
-    if (N < 8192)  tests.push_back({{8, 32, 32}, "8192 NICs"});
-    if (N < 16384) tests.push_back({{8, 64, 32}, "16384 NICs"});
+    if (N < 512)  tests.push_back({{8, 32, 16}, "512 NICs"});
+    if (N < 1024) tests.push_back({{8, 32, 32}, "1024 NICs"});
+    if (N < 2048) tests.push_back({{8, 64, 32}, "2048 NICs"});
 
     for (auto& tt : tests) {
         int tn = tt.tc.total_nics();
@@ -269,25 +275,50 @@ int main(int argc, char* argv[]) {
     }
 
     // ==================================================================
-    // [5] MET vs Barrier-based Parallel — head-to-head comparison
+    // [5] Scaling to Find the Parallel Crossover Point
+    //
+    // The bottleneck is not GPU vs CPU — it is topology size.
+    // Synchronization overhead is roughly fixed per run (~constant number
+    // of ticks and phases). As topology grows, useful work grows linearly.
+    // At some crossover point, work dominates overhead and parallel wins.
+    //
+    // "Ideal-1024" shows what 1024 perfectly parallel workers with zero
+    // synchronization overhead would achieve (sequential_time / 1024).
+    // This represents the algorithm's theoretical ceiling — the gap
+    // between this and real 8T results is the synchronization tax.
     // ==================================================================
-    printf("  [5] MET Causality vs Barrier-based Parallel\n");
+    printf("  [5] Scaling to Find the Parallel Crossover Point\n");
+    printf("  Sequential vs 8T-Barrier vs 8T-MET vs Ideal-1024T (theoretical)\n");
     printf("  ----------------------------------------------------------\n");
+
+    static constexpr int IDEAL_WORKERS = 1024;
 
     struct MT { TopoConfig tc; const char* label; };
     std::vector<MT> met_tests = {
-        {{8, 16, 16}, "2048 NICs"},
-        {{8, 32, 32}, "8192 NICs"},
-        {{8, 64, 32}, "16384 NICs"},
+        {{8,  16,  16},  "256 NICs"},
+        {{8,  32,  32}, "1024 NICs"},
+        {{8,  64,  32}, "2048 NICs"},
+        {{8,  64,  64}, "4096 NICs"},
+        {{8, 128,  64}, "8192 NICs"},
+        {{8, 128, 128}, "16384 NICs"},
+        {{8, 256, 128}, "32768 NICs"},
     };
 
-    printf("  %-12s  %-8s  %10s  %10s  %8s\n",
+    printf("  %-12s  %-12s  %10s  %10s  %8s\n",
            "Topology", "Method", "Wall(s)", "Mpkt/s", "Speedup");
-    printf("  %-12s  %-8s  %10s  %10s  %8s\n",
-           "------------", "--------", "----------", "----------", "--------");
+    printf("  %-12s  %-12s  %10s  %10s  %8s\n",
+           "------------", "------------", "----------", "----------", "--------");
 
     for (auto& mt : met_tests) {
-        int tn = mt.tc.total_nics();
+        // Sequential baseline
+        { SequentialSim w(mt.tc); w.run(); }
+        std::vector<double> seq_times;
+        Stats seq_last{};
+        for (int i = 0; i < TRIALS; i++) {
+            SequentialSim s(mt.tc); auto r = s.run();
+            seq_times.push_back(r.wall_sec); seq_last = r.stats;
+        }
+        auto st = measure(seq_times);
 
         // Barrier-based parallel (all threads)
         { ParallelSim w(mt.tc); w.run(threads); }
@@ -309,16 +340,30 @@ int main(int argc, char* argv[]) {
         }
         auto mt2 = measure(met_times);
 
-        printf("  %-12s  %-8s  %10.6f  %10.2f  %8s\n",
-               mt.label, "Barrier",
+        // Theoretical ideal: sequential work divided by IDEAL_WORKERS,
+        // zero synchronization overhead assumed.
+        double ideal_time = st.median / IDEAL_WORKERS;
+
+        printf("  %-12s  %-12s  %10.6f  %10.2f  %8s\n",
+               mt.label, "Sequential",
+               st.median,
+               seq_last.pkts_delivered / st.median / 1e6,
+               "1.00x");
+        printf("  %-12s  %-12s  %10.6f  %10.2f  %7.2fx\n",
+               "", "Barrier-8T",
                pt.median,
                par_last.pkts_delivered / pt.median / 1e6,
-               "-");
-        printf("  %-12s  %-8s  %10.6f  %10.2f  %7.2fx\n",
-               "", "MET",
+               st.median / pt.median);
+        printf("  %-12s  %-12s  %10.6f  %10.2f  %7.2fx\n",
+               "", "MET-8T",
                mt2.median,
                met_last.pkts_delivered / mt2.median / 1e6,
-               pt.median / mt2.median);
+               st.median / mt2.median);
+        printf("  %-12s  %-12s  %10.6f  %10.2f  %7.0fx  (theoretical)\n",
+               "", "Ideal-1024T",
+               ideal_time,
+               seq_last.pkts_delivered / ideal_time / 1e6,
+               (double)IDEAL_WORKERS);
         printf("\n");
     }
 

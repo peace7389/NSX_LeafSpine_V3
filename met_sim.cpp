@@ -23,6 +23,7 @@
  * to finish all packets.
  */
 #include "met_sim.h"
+#include <algorithm>
 #include <chrono>
 #include <climits>
 
@@ -113,6 +114,7 @@ void MetSim::phase_nic_tx(FastRNG& rng, Stats& stats) {
         for (int nic = 0; nic < N_; nic++) {
             Event e{};
             e.timestamp = sim_time + rng.with_jitter(SERIALIZATION_DELAY_PS);
+            e.gen_time  = sim_time;
             e.src_nic   = nic;
             e.dst_nic   = routing_[nic];
             e.pkt_id    = pkt_seq[nic]++;
@@ -152,10 +154,12 @@ bool MetSim::process_leaf_up(int leaf, FastRNG& rng) {
 
     if (safe <= leaf_up_cur_[leaf]) return false;
 
-    // Drain events from NIC queues
+    // Drain events from NIC queues and merge-sort across queues
     std::vector<Event> to_process;
     for (int p = 0; p < NPL_; p++)
         nic_to_leaf_q_[base + p].drain(safe, to_process);
+    std::sort(to_process.begin(), to_process.end(),
+              [](const Event& a, const Event& b){ return a.timestamp < b.timestamp; });
 
     auto& ls = leaf_state_[leaf];
     for (auto& e : to_process) {
@@ -229,6 +233,8 @@ bool MetSim::process_spine(int spine, FastRNG& rng) {
     std::vector<Event> to_process;
     for (int l = 0; l < NL_; l++)
         leaf_to_spine_q_[l * NS_ + spine].drain(safe, to_process);
+    std::sort(to_process.begin(), to_process.end(),
+              [](const Event& a, const Event& b){ return a.timestamp < b.timestamp; });
 
     auto& ss = spine_state_[spine];
     for (auto& e : to_process) {
@@ -301,6 +307,8 @@ bool MetSim::process_leaf_dn(int leaf, FastRNG& rng) {
     std::vector<Event> to_process;
     for (int s = 0; s < NS_; s++)
         spine_to_leaf_q_[s * NL_ + leaf].drain(safe, to_process);
+    std::sort(to_process.begin(), to_process.end(),
+              [](const Event& a, const Event& b){ return a.timestamp < b.timestamp; });
 
     auto& ls = leaf_state_[leaf];
     int base = leaf * NPL_;
@@ -362,7 +370,7 @@ bool MetSim::process_nic_rx(int nic, Stats& stats) {
 
     for (auto& e : to_process) {
         stats.pkts_delivered++;
-        stats.total_latency_ps += e.timestamp;
+        stats.total_latency_ps += e.timestamp - e.gen_time;
         stats.bytes_delivered  += e.pkt_size;
         stats.events_processed++;
     }

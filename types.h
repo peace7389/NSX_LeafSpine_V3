@@ -126,6 +126,7 @@ struct SwitchState {
 // ============================================================================
 struct Event {
     int64_t  timestamp;
+    int64_t  gen_time;   // sim_time when packet was generated (for latency calculation)
     int      src_nic;
     int      dst_nic;
     int      pkt_id;
